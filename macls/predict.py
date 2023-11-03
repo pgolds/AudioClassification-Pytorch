@@ -9,7 +9,9 @@ import yaml
 from macls import SUPPORT_MODEL
 from macls.data_utils.audio import AudioSegment
 from macls.data_utils.featurizer import AudioFeaturizer
+from macls.models.campplus import CAMPPlus
 from macls.models.ecapa_tdnn import EcapaTdnn
+from macls.models.eres2net import ERes2Net
 from macls.models.panns import PANNS_CNN6, PANNS_CNN10, PANNS_CNN14
 from macls.models.res2net import Res2Net
 from macls.models.resnet_se import ResNetSE
@@ -23,7 +25,7 @@ logger = setup_logger(__name__)
 class MAClsPredictor:
     def __init__(self,
                  configs,
-                 model_path='models/EcapaTdnn_MelSpectrogram/best_model/',
+                 model_path='models/EcapaTdnn_Fbank/best_model/',
                  use_gpu=True):
         """
         声音分类预测工具
@@ -45,43 +47,41 @@ class MAClsPredictor:
         self.configs = dict_to_object(configs)
         assert self.configs.use_model in SUPPORT_MODEL, f'没有该模型：{self.configs.use_model}'
         # 获取特征器
-        self._audio_featurizer = AudioFeaturizer(feature_conf=self.configs.feature_conf, **self.configs.preprocess_conf)
+        self._audio_featurizer = AudioFeaturizer(feature_method=self.configs.preprocess_conf.feature_method,
+                                                method_args=self.configs.preprocess_conf.get('method_args', {}))
         self._audio_featurizer.to(self.device)
+        # 获取分类标签
+        with open(self.configs.dataset_conf.label_list_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        self.class_labels = [l.replace('\n', '') for l in lines]
+        # 自动获取列表数量
+        if self.configs.model_conf.num_class is None:
+            self.configs.model_conf.num_class = len(self.class_labels)
         # 获取模型
         if self.configs.use_model == 'EcapaTdnn':
-            self.predictor = EcapaTdnn(input_size=self._audio_featurizer.feature_dim,
-                                       num_class=self.configs.dataset_conf.num_class,
-                                       **self.configs.model_conf)
+            self.predictor = EcapaTdnn(input_size=self._audio_featurizer.feature_dim, **self.configs.model_conf)
         elif self.configs.use_model == 'PANNS_CNN6':
-            self.predictor = PANNS_CNN6(input_size=self._audio_featurizer.feature_dim,
-                                        num_class=self.configs.dataset_conf.num_class,
-                                        **self.configs.model_conf)
+            self.predictor = PANNS_CNN6(input_size=self._audio_featurizer.feature_dim, **self.configs.model_conf)
         elif self.configs.use_model == 'PANNS_CNN10':
-            self.predictor = PANNS_CNN10(input_size=self._audio_featurizer.feature_dim,
-                                         num_class=self.configs.dataset_conf.num_class,
-                                         **self.configs.model_conf)
+            self.predictor = PANNS_CNN10(input_size=self._audio_featurizer.feature_dim, **self.configs.model_conf)
         elif self.configs.use_model == 'PANNS_CNN14':
-            self.predictor = PANNS_CNN14(input_size=self._audio_featurizer.feature_dim,
-                                         num_class=self.configs.dataset_conf.num_class,
-                                         **self.configs.model_conf)
+            self.predictor = PANNS_CNN14(input_size=self._audio_featurizer.feature_dim, **self.configs.model_conf)
         elif self.configs.use_model == 'Res2Net':
-            self.predictor = Res2Net(input_size=self._audio_featurizer.feature_dim,
-                                     num_class=self.configs.dataset_conf.num_class,
-                                     **self.configs.model_conf)
+            self.predictor = Res2Net(input_size=self._audio_featurizer.feature_dim, **self.configs.model_conf)
         elif self.configs.use_model == 'ResNetSE':
-            self.predictor = ResNetSE(input_size=self._audio_featurizer.feature_dim,
-                                      num_class=self.configs.dataset_conf.num_class,
-                                      **self.configs.model_conf)
+            self.predictor = ResNetSE(input_size=self._audio_featurizer.feature_dim, **self.configs.model_conf)
         elif self.configs.use_model == 'TDNN':
-            self.predictor = TDNN(input_size=self._audio_featurizer.feature_dim,
-                                  num_class=self.configs.dataset_conf.num_class,
-                                  **self.configs.model_conf)
+            self.predictor = TDNN(input_size=self._audio_featurizer.feature_dim, **self.configs.model_conf)
+        elif self.configs.use_model == 'ERes2Net':
+            self.predictor = ERes2Net(input_size=self._audio_featurizer.feature_dim, **self.configs.model_conf)
+        elif self.configs.use_model == 'CAMPPlus':
+            self.predictor = CAMPPlus(input_size=self._audio_featurizer.feature_dim, **self.configs.model_conf)
         else:
             raise Exception(f'{self.configs.use_model} 模型不存在！')
         self.predictor.to(self.device)
         # 加载模型
         if os.path.isdir(model_path):
-            model_path = os.path.join(model_path, 'model.pt')
+            model_path = os.path.join(model_path, 'model.pth')
         assert os.path.exists(model_path), f"{model_path} 模型不存在！"
         if torch.cuda.is_available() and use_gpu:
             model_state_dict = torch.load(model_path)
@@ -90,10 +90,6 @@ class MAClsPredictor:
         self.predictor.load_state_dict(model_state_dict)
         print(f"成功加载模型参数：{model_path}")
         self.predictor.eval()
-        # 获取分类标签
-        with open(self.configs.dataset_conf.label_list_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        self.class_labels = [l.replace('\n', '') for l in lines]
 
     def _load_audio(self, audio_data, sample_rate=16000):
         """加载音频
@@ -118,6 +114,8 @@ class MAClsPredictor:
         # decibel normalization
         if self.configs.dataset_conf.use_dB_normalization:
             audio_segment.normalize(target_db=self.configs.dataset_conf.target_dB)
+        assert audio_segment.duration >= self.configs.dataset_conf.min_duration, \
+            f'音频太短，最小应该为{self.configs.dataset_conf.min_duration}s，当前音频为{audio_segment.duration}s'
         return audio_segment
 
     # 预测一个音频的特征
@@ -132,8 +130,6 @@ class MAClsPredictor:
         """
         # 加载音频文件，并进行预处理
         input_data = self._load_audio(audio_data=audio_data, sample_rate=sample_rate)
-        assert input_data.duration >= self.configs.dataset_conf.min_duration, \
-            f'音频太短，最小应该为{self.configs.dataset_conf.min_duration}s，当前音频为{input_data.duration}s'
         input_data = torch.tensor(input_data.samples, dtype=torch.float32, device=self.device).unsqueeze(0)
         input_len_ratio = torch.tensor([1], dtype=torch.float32, device=self.device)
         audio_feature, _ = self._audio_featurizer(input_data, input_len_ratio)

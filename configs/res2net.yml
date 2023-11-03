@@ -77,8 +77,8 @@ optimizer_conf:
 model_conf:
   # 分类大小，如果为null，自动通过标签列表获取
   num_class: null
-  dropout: 0.1
-  extract_embedding: True
+  # 所使用的池化层，支持ASP、SAP、TSP、TAP
+  pooling_type: 'ASP'
 
 train_conf:
   # 是否开启自动混合精度
@@ -91,5 +91,5 @@ train_conf:
   max_epoch: 60
   log_interval: 10
 
-# 所使用的模型，支持PANNS_CNN6、PANNS_CNN10、PANNS_CNN14
-use_model: 'PANNS_CNN10'
+# 所使用的模型
+use_model: 'Res2Net'

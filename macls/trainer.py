@@ -22,12 +22,17 @@ from macls import SUPPORT_MODEL, __version__
 from macls.data_utils.collate_fn import collate_fn
 from macls.data_utils.featurizer import AudioFeaturizer
 from macls.data_utils.reader import CustomDataset
+from macls.data_utils.spec_aug import SpecAug
+from macls.metric.metrics import accuracy
+from macls.models.campplus import CAMPPlus
 from macls.models.ecapa_tdnn import EcapaTdnn
+from macls.models.eres2net import ERes2Net
 from macls.models.panns import PANNS_CNN6, PANNS_CNN10, PANNS_CNN14
 from macls.models.res2net import Res2Net
 from macls.models.resnet_se import ResNetSE
 from macls.models.tdnn import TDNN
 from macls.utils.logger import setup_logger
+from macls.utils.scheduler import WarmupCosineSchedulerLR
 from macls.utils.utils import dict_to_object, plot_confusion_matrix, print_arguments
 
 logger = setup_logger(__name__)
@@ -56,34 +61,38 @@ class MAClsTrainer(object):
         assert self.configs.use_model in SUPPORT_MODEL, f'没有该模型：{self.configs.use_model}'
         self.model = None
         self.test_loader = None
+        self.amp_scaler = None
         # 获取分类标签
         with open(self.configs.dataset_conf.label_list_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         self.class_labels = [l.replace('\n', '') for l in lines]
         if platform.system().lower() == 'windows':
-            self.configs.dataset_conf.num_workers = 0
+            self.configs.dataset_conf.dataLoader.num_workers = 0
             logger.warning('Windows系统不支持多线程读取数据，已自动关闭！')
         # 获取特征器
-        self.audio_featurizer = AudioFeaturizer(feature_conf=self.configs.feature_conf, **self.configs.preprocess_conf)
+        self.audio_featurizer = AudioFeaturizer(feature_method=self.configs.preprocess_conf.feature_method,
+                                                method_args=self.configs.preprocess_conf.get('method_args', {}))
+        self.audio_featurizer.to(self.device)
+        # 特征增强
+        self.spec_aug = SpecAug(**self.configs.dataset_conf.get('spec_aug_args', {}))
+        self.spec_aug.to(self.device)
+        # 获取分类标签
+        with open(self.configs.dataset_conf.label_list_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        self.class_labels = [l.replace('\n', '') for l in lines]
 
-    def __setup_dataloader(self, augment_conf_path=None, is_train=False):
-        # 获取训练数据
-        if augment_conf_path is not None and os.path.exists(augment_conf_path) and is_train:
-            augmentation_config = io.open(augment_conf_path, mode='r', encoding='utf8').read()
-        else:
-            if augment_conf_path is not None and not os.path.exists(augment_conf_path):
-                logger.info('数据增强配置文件{}不存在'.format(augment_conf_path))
-            augmentation_config = '{}'
+    def __setup_dataloader(self, is_train=False):
         if is_train:
             self.train_dataset = CustomDataset(data_list_path=self.configs.dataset_conf.train_list,
                                                do_vad=self.configs.dataset_conf.do_vad,
                                                max_duration=self.configs.dataset_conf.max_duration,
                                                min_duration=self.configs.dataset_conf.min_duration,
-                                               augmentation_config=augmentation_config,
+                                               aug_conf=self.configs.dataset_conf.aug_conf,
                                                sample_rate=self.configs.dataset_conf.sample_rate,
                                                use_dB_normalization=self.configs.dataset_conf.use_dB_normalization,
                                                target_dB=self.configs.dataset_conf.target_dB,
                                                mode='train')
+            # 设置支持多卡训练
             train_sampler = None
             if torch.cuda.device_count() > 1:
                 # 设置支持多卡训练
@@ -91,87 +100,102 @@ class MAClsTrainer(object):
             self.train_loader = DataLoader(dataset=self.train_dataset,
                                            collate_fn=collate_fn,
                                            shuffle=(train_sampler is None),
-                                           batch_size=self.configs.dataset_conf.batch_size,
                                            sampler=train_sampler,
-                                           num_workers=self.configs.dataset_conf.num_workers)
+                                           **self.configs.dataset_conf.dataLoader)
         # 获取测试数据
         self.test_dataset = CustomDataset(data_list_path=self.configs.dataset_conf.test_list,
                                           do_vad=self.configs.dataset_conf.do_vad,
-                                          max_duration=self.configs.dataset_conf.max_duration,
+                                          max_duration=self.configs.dataset_conf.eval_conf.max_duration,
                                           min_duration=self.configs.dataset_conf.min_duration,
                                           sample_rate=self.configs.dataset_conf.sample_rate,
                                           use_dB_normalization=self.configs.dataset_conf.use_dB_normalization,
                                           target_dB=self.configs.dataset_conf.target_dB,
                                           mode='eval')
         self.test_loader = DataLoader(dataset=self.test_dataset,
-                                      batch_size=self.configs.dataset_conf.batch_size,
                                       collate_fn=collate_fn,
-                                      num_workers=self.configs.dataset_conf.num_workers)
+                                      shuffle=True,
+                                      batch_size=self.configs.dataset_conf.eval_conf.batch_size,
+                                      num_workers=self.configs.dataset_conf.dataLoader.num_workers)
 
     def __setup_model(self, input_size, is_train=False):
+        # 自动获取列表数量
+        if self.configs.model_conf.num_class is None:
+            self.configs.model_conf.num_class = len(self.class_labels)
         # 获取模型
         if self.configs.use_model == 'EcapaTdnn':
-            self.model = EcapaTdnn(input_size=input_size,
-                                   num_class=self.configs.dataset_conf.num_class,
-                                   **self.configs.model_conf)
+            self.model = EcapaTdnn(input_size=input_size, **self.configs.model_conf)
         elif self.configs.use_model == 'PANNS_CNN6':
-            self.model = PANNS_CNN6(input_size=input_size,
-                                    num_class=self.configs.dataset_conf.num_class,
-                                    **self.configs.model_conf)
+            self.model = PANNS_CNN6(input_size=input_size, **self.configs.model_conf)
         elif self.configs.use_model == 'PANNS_CNN10':
-            self.model = PANNS_CNN10(input_size=input_size,
-                                     num_class=self.configs.dataset_conf.num_class,
-                                     **self.configs.model_conf)
+            self.model = PANNS_CNN10(input_size=input_size, **self.configs.model_conf)
         elif self.configs.use_model == 'PANNS_CNN14':
-            self.model = PANNS_CNN14(input_size=input_size,
-                                     num_class=self.configs.dataset_conf.num_class,
-                                     **self.configs.model_conf)
+            self.model = PANNS_CNN14(input_size=input_size, **self.configs.model_conf)
         elif self.configs.use_model == 'Res2Net':
-            self.model = Res2Net(input_size=input_size,
-                                 num_class=self.configs.dataset_conf.num_class,
-                                 **self.configs.model_conf)
+            self.model = Res2Net(input_size=input_size, **self.configs.model_conf)
         elif self.configs.use_model == 'ResNetSE':
-            self.model = ResNetSE(input_size=input_size,
-                                  num_class=self.configs.dataset_conf.num_class,
-                                  **self.configs.model_conf)
+            self.model = ResNetSE(input_size=input_size, **self.configs.model_conf)
         elif self.configs.use_model == 'TDNN':
-            self.model = TDNN(input_size=input_size,
-                              num_class=self.configs.dataset_conf.num_class,
-                              **self.configs.model_conf)
+            self.model = TDNN(input_size=input_size, **self.configs.model_conf)
+        elif self.configs.use_model == 'ERes2Net':
+            self.model = ERes2Net(input_size=input_size, **self.configs.model_conf)
+        elif self.configs.use_model == 'CAMPPlus':
+            self.model = CAMPPlus(input_size=input_size, **self.configs.model_conf)
         else:
             raise Exception(f'{self.configs.use_model} 模型不存在！')
         self.model.to(self.device)
         self.audio_featurizer.to(self.device)
         summary(self.model, input_size=(1, 98, self.audio_featurizer.feature_dim))
+        # 使用Pytorch2.0的编译器
+        if self.configs.train_conf.use_compile and torch.__version__ >= "2" and platform.system().lower() == 'windows':
+            self.model = torch.compile(self.model, mode="reduce-overhead")
         # print(self.model)
         # 获取损失函数
-        self.loss = torch.nn.CrossEntropyLoss()
+        weight = torch.tensor(self.configs.train_conf.loss_weight, dtype=torch.float, device=self.device)\
+            if self.configs.train_conf.loss_weight is not None else None
+        self.loss = torch.nn.CrossEntropyLoss(weight=weight)
         if is_train:
+            if self.configs.train_conf.enable_amp:
+                self.amp_scaler = torch.cuda.amp.GradScaler(init_scale=1024)
             # 获取优化方法
             optimizer = self.configs.optimizer_conf.optimizer
             if optimizer == 'Adam':
                 self.optimizer = torch.optim.Adam(params=self.model.parameters(),
-                                                  lr=float(self.configs.optimizer_conf.learning_rate),
-                                                  weight_decay=float(self.configs.optimizer_conf.weight_decay))
+                                                  lr=self.configs.optimizer_conf.learning_rate,
+                                                  weight_decay=self.configs.optimizer_conf.weight_decay)
             elif optimizer == 'AdamW':
                 self.optimizer = torch.optim.AdamW(params=self.model.parameters(),
-                                                   lr=float(self.configs.optimizer_conf.learning_rate),
-                                                   weight_decay=float(self.configs.optimizer_conf.weight_decay))
+                                                   lr=self.configs.optimizer_conf.learning_rate,
+                                                   weight_decay=self.configs.optimizer_conf.weight_decay)
             elif optimizer == 'SGD':
                 self.optimizer = torch.optim.SGD(params=self.model.parameters(),
-                                                 momentum=self.configs.optimizer_conf.momentum,
-                                                 lr=float(self.configs.optimizer_conf.learning_rate),
-                                                 weight_decay=float(self.configs.optimizer_conf.weight_decay))
+                                                 momentum=self.configs.optimizer_conf.get('momentum', 0.9),
+                                                 lr=self.configs.optimizer_conf.learning_rate,
+                                                 weight_decay=self.configs.optimizer_conf.weight_decay)
             else:
                 raise Exception(f'不支持优化方法：{optimizer}')
             # 学习率衰减函数
-            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=int(self.configs.train_conf.max_epoch * 1.2))
+            scheduler_args = self.configs.optimizer_conf.get('scheduler_args', {}) \
+                if self.configs.optimizer_conf.get('scheduler_args', {}) is not None else {}
+            if self.configs.optimizer_conf.scheduler == 'CosineAnnealingLR':
+                max_step = int(self.configs.train_conf.max_epoch * 1.2) * len(self.train_loader)
+                self.scheduler = CosineAnnealingLR(optimizer=self.optimizer,
+                                                   T_max=max_step,
+                                                   **scheduler_args)
+            elif self.configs.optimizer_conf.scheduler == 'WarmupCosineSchedulerLR':
+                self.scheduler = WarmupCosineSchedulerLR(optimizer=self.optimizer,
+                                                         fix_epoch=self.configs.train_conf.max_epoch,
+                                                         step_per_epoch=len(self.train_loader),
+                                                         **scheduler_args)
+            else:
+                raise Exception(f'不支持学习率衰减函数：{self.configs.optimizer_conf.scheduler}')
+        if self.configs.train_conf.use_compile and torch.__version__ >= "2" and platform.system().lower() != 'windows':
+            self.model = torch.compile(self.model, mode="reduce-overhead")
 
     def __load_pretrained(self, pretrained_model):
         # 加载预训练模型
         if pretrained_model is not None:
             if os.path.isdir(pretrained_model):
-                pretrained_model = os.path.join(pretrained_model, 'model.pt')
+                pretrained_model = os.path.join(pretrained_model, 'model.pth')
             assert os.path.exists(pretrained_model), f"{pretrained_model} 模型不存在！"
             if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
                 model_dict = self.model.module.state_dict()
@@ -199,23 +223,28 @@ class MAClsTrainer(object):
         last_model_dir = os.path.join(save_model_path,
                                       f'{self.configs.use_model}_{self.configs.preprocess_conf.feature_method}',
                                       'last_model')
-        if resume_model is not None or (os.path.exists(os.path.join(last_model_dir, 'model.pt'))
-                                        and os.path.exists(os.path.join(last_model_dir, 'optimizer.pt'))):
+        if resume_model is not None or (os.path.exists(os.path.join(last_model_dir, 'model.pth'))
+                                        and os.path.exists(os.path.join(last_model_dir, 'optimizer.pth'))):
             # 自动获取最新保存的模型
             if resume_model is None: resume_model = last_model_dir
-            assert os.path.exists(os.path.join(resume_model, 'model.pt')), "模型参数文件不存在！"
-            assert os.path.exists(os.path.join(resume_model, 'optimizer.pt')), "优化方法参数文件不存在！"
-            state_dict = torch.load(os.path.join(resume_model, 'model.pt'))
+            assert os.path.exists(os.path.join(resume_model, 'model.pth')), "模型参数文件不存在！"
+            assert os.path.exists(os.path.join(resume_model, 'optimizer.pth')), "优化方法参数文件不存在！"
+            state_dict = torch.load(os.path.join(resume_model, 'model.pth'))
             if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
                 self.model.module.load_state_dict(state_dict)
             else:
                 self.model.load_state_dict(state_dict)
-            self.optimizer.load_state_dict(torch.load(os.path.join(resume_model, 'optimizer.pt')))
+            self.optimizer.load_state_dict(torch.load(os.path.join(resume_model, 'optimizer.pth')))
+            # 自动混合精度参数
+            if self.amp_scaler is not None and os.path.exists(os.path.join(resume_model, 'scaler.pth')):
+                self.amp_scaler.load_state_dict(torch.load(os.path.join(resume_model, 'scaler.pth')))
             with open(os.path.join(resume_model, 'model.state'), 'r', encoding='utf-8') as f:
                 json_data = json.load(f)
                 last_epoch = json_data['last_epoch'] - 1
                 best_acc = json_data['accuracy']
             logger.info('成功恢复模型参数和优化方法参数：{}'.format(resume_model))
+            self.optimizer.step()
+            [self.scheduler.step() for _ in range(last_epoch * len(self.train_loader))]
         return last_epoch, best_acc
 
     # 保存模型
@@ -233,8 +262,11 @@ class MAClsTrainer(object):
                                       f'{self.configs.use_model}_{self.configs.preprocess_conf.feature_method}',
                                       'epoch_{}'.format(epoch_id))
         os.makedirs(model_path, exist_ok=True)
-        torch.save(self.optimizer.state_dict(), os.path.join(model_path, 'optimizer.pt'))
-        torch.save(state_dict, os.path.join(model_path, 'model.pt'))
+        torch.save(self.optimizer.state_dict(), os.path.join(model_path, 'optimizer.pth'))
+        torch.save(state_dict, os.path.join(model_path, 'model.pth'))
+        # 自动混合精度参数
+        if self.amp_scaler is not None:
+            torch.save(self.amp_scaler.state_dict(), os.path.join(model_path, 'scaler.pth'))
         with open(os.path.join(model_path, 'model.state'), 'w', encoding='utf-8') as f:
             data = {"last_epoch": epoch_id, "accuracy": best_acc, "version": __version__}
             f.write(json.dumps(data))
@@ -266,27 +298,41 @@ class MAClsTrainer(object):
                 input_lens_ratio = input_lens_ratio.to(self.device)
                 label = label.to(self.device).long()
             features, _ = self.audio_featurizer(audio, input_lens_ratio)
-            output = self.model(features)
+            # 特征增强
+            if self.configs.dataset_conf.use_spec_aug:
+                features = self.spec_aug(features)
+            # 执行模型计算，是否开启自动混合精度
+            with torch.cuda.amp.autocast(enabled=self.configs.train_conf.enable_amp):
+                output = self.model(features)
             # 计算损失值
             los = self.loss(output, label)
+            # 是否开启自动混合精度
+            if self.configs.train_conf.enable_amp:
+                # loss缩放，乘以系数loss_scaling
+                scaled = self.amp_scaler.scale(los)
+                scaled.backward()
+            else:
+                los.backward()
+            # 是否开启自动混合精度
+            if self.configs.train_conf.enable_amp:
+                self.amp_scaler.unscale_(self.optimizer)
+                self.amp_scaler.step(self.optimizer)
+                self.amp_scaler.update()
+            else:
+                self.optimizer.step()
             self.optimizer.zero_grad()
-            los.backward()
-            self.optimizer.step()
 
             # 计算准确率
-            output = torch.nn.functional.softmax(output, dim=-1)
-            output = output.data.cpu().numpy()
-            output = np.argmax(output, axis=1)
-            label = label.data.cpu().numpy()
-            acc = np.mean((output == label).astype(int))
+            acc = accuracy(output, label)
             accuracies.append(acc)
-            loss_sum.append(los)
+            loss_sum.append(los.data.cpu().numpy())
             train_times.append((time.time() - start) * 1000)
 
             # 多卡训练只使用一个进程打印
             if batch_id % self.configs.train_conf.log_interval == 0 and local_rank == 0:
+                batch_id = batch_id + 1
                 # 计算每秒训练数据量
-                train_speed = self.configs.dataset_conf.batch_size / (sum(train_times) / len(train_times) / 1000)
+                train_speed = self.configs.dataset_conf.dataLoader.batch_size / (sum(train_times) / len(train_times) / 1000)
                 # 计算剩余时间
                 eta_sec = (sum(train_times) / len(train_times)) * (
                         sum_batch - (epoch_id - 1) * len(self.train_loader) - batch_id)
@@ -301,22 +347,20 @@ class MAClsTrainer(object):
                 writer.add_scalar('Train/Accuracy', (sum(accuracies) / len(accuracies)), self.train_step)
                 # 记录学习率
                 writer.add_scalar('Train/lr', self.scheduler.get_last_lr()[0], self.train_step)
-                train_times = []
+                train_times, accuracies, loss_sum = [], [], []
                 self.train_step += 1
             start = time.time()
-        self.scheduler.step()
+            self.scheduler.step()
 
     def train(self,
               save_model_path='models/',
               resume_model=None,
-              pretrained_model=None,
-              augment_conf_path='configs/augmentation.json'):
+              pretrained_model=None):
         """
         训练模型
         :param save_model_path: 模型保存的路径
         :param resume_model: 恢复训练，当为None则不使用预训练模型
         :param pretrained_model: 预训练模型的路径，当为None则不使用预训练模型
-        :param augment_conf_path: 数据增强的配置文件，为json格式
         """
         # 获取有多少张显卡训练
         nranks = torch.cuda.device_count()
@@ -332,7 +376,7 @@ class MAClsTrainer(object):
             local_rank = int(os.environ["LOCAL_RANK"])
 
         # 获取数据
-        self.__setup_dataloader(augment_conf_path=augment_conf_path, is_train=True)
+        self.__setup_dataloader(is_train=True)
         # 获取模型
         self.__setup_model(input_size=self.audio_featurizer.feature_dim, is_train=True)
 
@@ -360,7 +404,7 @@ class MAClsTrainer(object):
             # 多卡训练只使用一个进程执行评估和保存模型
             if local_rank == 0:
                 logger.info('=' * 70)
-                loss, acc = self.evaluate(resume_model=None)
+                loss, acc = self.evaluate()
                 logger.info('Test epoch: {}, time/epoch: {}, loss: {:.5f}, accuracy: {:.5f}'.format(
                     epoch_id, str(timedelta(seconds=(time.time() - start_epoch))), loss, acc))
                 logger.info('=' * 70)
@@ -376,7 +420,7 @@ class MAClsTrainer(object):
                 # 保存模型
                 self.__save_checkpoint(save_model_path=save_model_path, epoch_id=epoch_id, best_acc=acc)
 
-    def evaluate(self, resume_model='models/EcapaTdnn_MelSpectrogram/best_model/', save_matrix_path=None):
+    def evaluate(self, resume_model=None, save_matrix_path=None):
         """
         评估模型
         :param resume_model: 所使用的模型
@@ -389,7 +433,7 @@ class MAClsTrainer(object):
             self.__setup_model(input_size=self.audio_featurizer.feature_dim)
         if resume_model is not None:
             if os.path.isdir(resume_model):
-                resume_model = os.path.join(resume_model, 'model.pt')
+                resume_model = os.path.join(resume_model, 'model.pth')
             assert os.path.exists(resume_model), f"{resume_model} 模型不存在！"
             model_state_dict = torch.load(resume_model)
             self.model.load_state_dict(model_state_dict)
@@ -409,17 +453,16 @@ class MAClsTrainer(object):
                 features, _ = self.audio_featurizer(audio, input_lens_ratio)
                 output = eval_model(features)
                 los = self.loss(output, label)
+                # 计算准确率
+                acc = accuracy(output, label)
+                accuracies.append(acc)
+                # 模型预测标签
                 label = label.data.cpu().numpy()
                 output = output.data.cpu().numpy()
-                # 模型预测标签
                 pred = np.argmax(output, axis=1)
                 preds.extend(pred.tolist())
                 # 真实标签
                 labels.extend(label.tolist())
-
-                # 计算准确率
-                acc = np.mean((pred == label).astype(int))
-                accuracies.append(acc)
                 losses.append(los.data.cpu().numpy())
         loss = float(sum(losses) / len(losses))
         acc = float(sum(accuracies) / len(accuracies))
@@ -432,7 +475,7 @@ class MAClsTrainer(object):
         self.model.train()
         return loss, acc
 
-    def export(self, save_model_path='models/', resume_model='models/EcapaTdnn_MelSpectrogram/best_model/'):
+    def export(self, save_model_path='models/', resume_model='models/EcapaTdnn_Fbank/best_model/'):
         """
         导出预测模型
         :param save_model_path: 模型保存的路径
@@ -442,7 +485,7 @@ class MAClsTrainer(object):
         self.__setup_model(input_size=self.audio_featurizer.feature_dim)
         # 加载预训练模型
         if os.path.isdir(resume_model):
-            resume_model = os.path.join(resume_model, 'model.pt')
+            resume_model = os.path.join(resume_model, 'model.pth')
         assert os.path.exists(resume_model), f"{resume_model} 模型不存在！"
         model_state_dict = torch.load(resume_model)
         self.model.load_state_dict(model_state_dict)
@@ -452,7 +495,7 @@ class MAClsTrainer(object):
         infer_model = self.model.export()
         infer_model_path = os.path.join(save_model_path,
                                         f'{self.configs.use_model}_{self.configs.preprocess_conf.feature_method}',
-                                        'inference.pt')
+                                        'inference.pth')
         os.makedirs(os.path.dirname(infer_model_path), exist_ok=True)
         torch.jit.save(infer_model, infer_model_path)
         logger.info("预测模型已保存：{}".format(infer_model_path))
