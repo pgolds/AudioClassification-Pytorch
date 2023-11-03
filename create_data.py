@@ -59,5 +59,5 @@ def create_UrbanSound8K_list(audio_path, metadata_path, list_path):
 
 
 if __name__ == '__main__':
-    # get_data_list('dataset/audio', 'dataset')
-    create_UrbanSound8K_list('dataset/UrbanSound8K/audio', 'dataset/UrbanSound8K/metadata/UrbanSound8K.csv', 'dataset')
+    get_data_list('dataset/audio', 'dataset')
+    # create_UrbanSound8K_list('dataset/UrbanSound8K/audio', 'dataset/UrbanSound8K/metadata/UrbanSound8K.csv', 'dataset')
